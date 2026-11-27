@@ -58,23 +58,44 @@ at UCLA, but this Mac won't connect; the terminal says so. If it is unclear whet
 the result reached openconnect, `seasnet-vpn` checks whether openconnect moved on,
 and otherwise ends the attempt.
 
-**Web sign-in.** When a touch can't do it, UCLA's own pages open in a window of
-ours in the same place, for the same login, and the terminal says why in one line.
-That happens by itself when there is no key or it no longer works, Touch ID is
-unavailable (lid closed), or vlt can't be reached, has no valid VPN credentials,
-doesn't know the key, refuses, needs you to act (then `vlt vpn reset`), or doesn't
-recognize UCLA's answer. Otherwise it is the **Sign in here instead** button:
-wrong finger, locked or interrupted Touch ID, a failed login, a rate limit, or a
-lost answer from vlt.
+**Web sign-in.** When a touch can't do it, the same login continues on UCLA's own
+pages, and the terminal says why in one line. That happens by itself when there is
+no key or it no longer works, Touch ID is unavailable (lid closed), or vlt can't be
+reached, has no valid VPN credentials, doesn't know the key, refuses, needs you to
+act (then `vlt vpn reset`), or doesn't recognize UCLA's answer. Otherwise it is the
+**Sign in here instead** button: wrong finger, locked or interrupted Touch ID, a
+failed login, a rate limit, or a lost answer from vlt.
+
+**In Zen first.** The pages open in your default browser through macOS's sign-in
+session (ASWebAuthenticationSession), so 1Password fills there and its passkeys
+work. Zen (Firefox 159+) opens them in a small window of its own, with your normal
+profile, extensions and cookies, after macOS asks once whether the app may use the
+site to sign in. A small card of ours ("Continue in Zen") stands beside it.
+
+- Zen hands the result to openconnect itself. `seasnet-vpn` sees it land when
+  openconnect closes its listener and logs its next `POST https://…`, both required.
+  It watches openconnect's log with kqueue, so Zen's window closes within moments
+  of UCLA's "you can close this" page, before the tunnel is even up.
+- Cancel or Esc on the card cancels the login. If Zen's window closes without a
+  result (you closed it, said no to macOS's alert, or Zen gave up), the card stays:
+  **Try Zen again**, **Sign in here instead**, or Cancel.
+- **Sign in here instead** opens our own window below. So does, by itself, a
+  session that can't start or ends in an error, or a default browser that doesn't
+  take these sessions; `events.log` says which.
+- The session is not private ("ephemeral"): Firefox would open a private window,
+  where 1Password doesn't run unless allowed there.
+
+**Our own window**, when the browser can't do it:
 
 - Password and Duo push work there. Passkeys, security keys and Touch ID don't:
-  they need an Apple entitlement. ⌘\ may fill from 1Password.
+  Apple allows WebAuthn in an app's web view only for that app's own domains. ⌘\ may fill from 1Password.
 - Once UCLA's VPN server has the sign-in, its own pages run behind the Connecting
   panel and are never shown. The window hides in the same callback that gives it
   the login result, and nothing loads after that.
 - `~/.local/state/seasnet-vpn/signin-trace.log` keeps the last three attempts' steps:
-  verdict, method, host, a known path or "other", status and time. No queries,
-  tokens or page text.
+  verdict, method, host, a known path or "other", status and time, and for the
+  browser route its states and when the result landed. No queries, tokens or page
+  text.
 - Only HTTPS on `ucla.edu` and Duo's `api-*.duosecurity.com` opens, plus the one
   `localhost:29786` request. Anything else, pop-ups included, is blocked with a
   message.
@@ -84,7 +105,7 @@ lost answer from vlt.
 - It is a separate process with neither the approval key nor vlt, and the card
   never creates a web view.
 
-The login opens in Zen only if neither window can be built or run.
+The login opens in a plain Zen tab only if our app can't be built or run.
 
 `signin/*.swift` is compiled on first use (a few seconds, again after any change)
 into `~/.local/share/seasnet-vpn/UCLA VPN Sign-In.app`, and only the very file that

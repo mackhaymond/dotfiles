@@ -1,6 +1,7 @@
 #if TESTING
 // Tests and previews. Never in the app seasnet-vpn builds, and the only place a
 // software key exists.
+import AuthenticationServices
 import Cocoa
 import CryptoKit
 import LocalAuthentication
@@ -279,6 +280,7 @@ func selfTest(_ directory: String) -> Never {
         skipped = true
     }
     webSelfTest(check)
+    browserSelfTest(check)
     if failures > 0 {
         print("self-test: \(failures) failed")
         exit(1)
@@ -336,6 +338,17 @@ func renderWebPreviews(to out: URL) {
         ("web-10-refused", WebController.Lost.refused(404).phase, "", 2, nil, ""),
         ("web-8-cancelled", .ended, "", 2, nil, ""),
     ]
+    for (scheme, name) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+        for (title, reason, closed) in [("zen-1-continue", "", false), ("zen-2-continue-with-reason", "vlt couldn’t be reached", false),
+                                        ("zen-3-window-closed", "vlt couldn’t be reached", true)] {
+            let model = BrowserModel()
+            (model.browser, model.reason, model.closed) = ("Zen", reason, closed)
+            let window = BrowserController.makeWindow()
+            window.appearance = NSAppearance(named: name)
+            window.contentView = BrowserController.root(model: model, asKey: true)
+            writePreview(window, out.appendingPathComponent("\(title)-\(scheme).png"))
+        }
+    }
     for (scheme, name) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
         for (title, phase, host, reached, notice, reason) in states {
             let model = WebModel()
@@ -595,6 +608,128 @@ func gatewaySelfTest(_ check: @escaping (Bool, String) -> Void, callbackQuery: S
         spin(2) { !listener.seen.isEmpty }
         print("note \(name) to localhost from an https page: \(sawCallback ? "seen by the policy" : "not seen by the policy"), \(listener.seen.isEmpty ? "blocked by WebKit" : "reached the listener")")
     }
+}
+
+/// Stands in for ASWebAuthenticationSession: nothing reaches a browser.
+final class FakeBrowserAuth: BrowserAuth {
+    var starts = true, started = false, cancelled = 0
+    var ended: (Error?) -> Void = { _ in }
+    func start() -> Bool { started = starts; return starts }
+    func cancel() { cancelled += 1 }
+}
+
+func browserSelfTest(_ check: @escaping (Bool, String) -> Void) {
+    let zen: [String: Any] = ["ASWebAuthenticationSessionWebBrowserSupportCapabilities":
+        ["IsSupported": true, "CallbackURLMatchingIsSupported": true, "EphemeralBrowserSessionIsSupported": true]]
+    check(DefaultBrowser.supports("app.zen-browser.zen", zen), "Zen's Info.plist says it takes the session")
+    check(DefaultBrowser.supports("x", ["ASWebAuthenticationSessionWebBrowserSupportCapabilities": ["IsSupported": NSNumber(value: 1)]]), "as a number too")
+    check(DefaultBrowser.supports("com.apple.Safari", [:]), "Safari always does")
+    for info in [[:], ["ASWebAuthenticationSessionWebBrowserSupportCapabilities": ["IsSupported": false]],
+                 ["ASWebAuthenticationSessionWebBrowserSupportCapabilities": "yes"]] as [[String: Any]] {
+        check(!DefaultBrowser.supports("com.google.Chrome", info), "a browser that doesn't say so is not used: \(info)")
+    }
+    check(DefaultBrowser(bundleID: "app.zen-browser.zen", name: "Zen", supported: true).traceName == "zen"
+          && DefaultBrowser(bundleID: "com.example.secret", name: "x", supported: true).traceName == "other", "trace names are a closed set")
+    let scheme = SystemBrowserAuth.callbackScheme
+    check(scheme.range(of: "^[a-z][a-z0-9+.-]*$", options: .regularExpression) != nil && !["http", "https"].contains(scheme)
+          && URL(string: "\(scheme)://x") != nil, "the callback scheme is valid and never occurs on the web")
+    let url = URL(string: "https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login?tgname=x")!
+    let anchor = NSWindow()
+    let real = SystemBrowserAuth(url: url, anchor: anchor, ended: { _ in })  // Made, never started.
+    check(!real.ephemeral, "not ephemeral: Firefox would use a private window, without 1Password")
+    withExtendedLifetime(anchor) {}
+
+    func make(_ configure: (FakeBrowserAuth) -> Void = { _ in }) -> (BrowserController, FakeBrowserAuth, () -> Int32?, () -> [String], () -> [String]) {
+        let auth = FakeBrowserAuth()
+        configure(auth)
+        let controller = BrowserController(browser: DefaultBrowser(bundleID: "app.zen-browser.zen", name: "Zen", supported: true),
+                                           reason: "", interactive: false) { anchor, ended in
+            auth.ended = ended
+            return auth
+        }
+        controller.cancelGrace = 0.3
+        var code: Int32?, fell: [String] = [], states: [String] = []
+        controller.finish = { code = $0 }
+        controller.fallBack = { fell.append($0) }
+        controller.emitTrace = { states.append($0["zen"] ?? "") }
+        return (controller, auth, { code }, { fell }, { states })
+    }
+    let canceled = NSError(domain: ASWebAuthenticationSessionErrorDomain, code: ASWebAuthenticationSessionError.canceledLogin.rawValue)
+
+    let (done, doneAuth, doneCode, _, doneStates) = make()
+    check(done.window.title == windowTitle && done.window.level == .normal && !done.window.isVisible
+          && done.window.collectionBehavior.contains(.moveToActiveSpace), "card attributes, not on screen, not over the browser")
+    done.begin()
+    check(doneAuth.started && doneStates() == ["started"], "starts the session")
+    done.done()
+    check(doneAuth.cancelled == 1 && doneCode() == nil, "done cancels the session, then waits for the answer")
+    doneAuth.ended(canceled)
+    check(doneCode() == 0 && doneStates() == ["started", "done"], "done closes with success once the browser has heard")
+    let (slow, slowAuth, slowCode, _, _) = make()
+    slow.begin(); slow.done()
+    spin(1) { slowCode() != nil }
+    check(slowCode() == 0 && slowAuth.cancelled == 1, "and does not wait forever for it")
+
+    for (name, act) in [("Cancel", { $0.model.cancel() }), ("Esc", { $0.window.cancelOperation(nil) }),
+                        ("close", { _ = $0.windowShouldClose($0.window) })] as [(String, (BrowserController) -> Void)] {
+        let (one, auth, code, fell, _) = make()
+        one.begin(); act(one); auth.ended(canceled)
+        check(code() == 1 && auth.cancelled == 1 && fell().isEmpty, "\(name) cancels the browser too")
+    }
+    // Ended without us, at any moment: the card stays and asks.
+    for wait in [0.0, 0.5] {
+        let (closed, closedAuth, closedCode, closedFell, closedStates) = make()
+        closed.begin(); spin(wait)
+        closedAuth.ended(canceled)
+        check(closedCode() == nil && closedFell().isEmpty && closed.model.closed && !closed.over && closedStates().last == "closed-by-person",
+              "a browser window closed after \(wait) s leaves the card asking, no exit, no fallback")
+        closed.model.again()
+        check(closedAuth.started && closedStates().suffix(2) == ["retry", "started"] && !closed.model.closed, "Try Zen again starts a new session")
+        closedAuth.ended(canceled)
+        closed.model.here()
+        check(closedFell() == ["chosen-here"] && closedCode() == nil, "or our own window")
+    }
+    let (closedCancel, closedCancelAuth, closedCancelCode, _, _) = make()
+    closedCancel.begin(); closedCancelAuth.ended(canceled)
+    closedCancel.window.cancelOperation(nil)
+    check(closedCancelCode() == 1 && closedCancelAuth.cancelled == 0, "or Esc/Cancel ends it at once, nothing left to cancel")
+    let (twice, twiceAuth, _, _, twiceStates) = make()
+    twice.begin(); twiceAuth.ended(canceled)
+    twice.model.again(); twice.model.again()
+    check(twiceStates().filter { $0 == "started" }.count == 2, "a double click starts one new session")
+    let (err, errAuth, errCode, errFell, errStates) = make()
+    err.begin(); spin(0.5)
+    errAuth.ended(NSError(domain: ASWebAuthenticationSessionErrorDomain, code: ASWebAuthenticationSessionError.presentationContextInvalid.rawValue))
+    check(errCode() == nil && errFell() == ["error"] && errStates().contains("error"), "any other error goes to our window")
+    let (refuse, _, refuseCode, refuseFell, _) = make { $0.starts = false }
+    refuse.begin()
+    check(refuseCode() == nil && refuseFell() == ["unstartable"], "a session that won't start goes to our window")
+    let (here, hereAuth, hereCode, hereFell, _) = make()
+    here.begin(); here.model.here()
+    hereAuth.ended(canceled)
+    check(hereAuth.cancelled == 1 && hereFell() == ["chosen-here"] && hereCode() == nil, "Sign in here instead drops the browser's session")
+    let (eof, eofAuth, eofCode, _, _) = make()
+    eof.begin(); eof.end(4); eofAuth.ended(canceled)
+    check(eofCode() == 4 && eofAuth.cancelled == 1, "EOF closes the browser's window too")
+
+    // The app: browser first, our window only on a fallback, and "done" goes to the browser.
+    let (shown, shownAuth, _, _, _) = make()
+    var webs = 0
+    let delegate = WebAppDelegate(browser: shown) {
+        webs += 1
+        return WebController(start: url, store: .nonPersistent(), interactive: false)
+    }
+    delegate.show()
+    check(shownAuth.started && webs == 0, "shows the card and starts the browser, no web window")
+    delegate.handle("done")
+    check(shownAuth.cancelled == 1, "done reaches the browser")
+    let (fallback, fallbackAuth, _, _, _) = make { $0.starts = false }
+    let fallbackDelegate = WebAppDelegate(browser: fallback) {
+        webs += 1
+        return WebController(start: url, store: .nonPersistent(), interactive: false)
+    }
+    fallbackDelegate.show()
+    check(!fallbackAuth.started && webs == 1 && fallbackDelegate.controller != nil, "a fallback opens our own web window")
 }
 
 func webSelfTest(_ check: @escaping (Bool, String) -> Void) {

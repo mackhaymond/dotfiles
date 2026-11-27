@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import select
 from pathlib import Path
 import shutil
 import signal
@@ -113,6 +114,13 @@ for n, step in enumerate(json.load(open(D + "/steps" + W))):
     elif step == "unknown": emit(event="unknown"); hang()
     elif step == "late": time.sleep(1); emit(event="signed", challenge="A" * 42 + "_", signature="S" * 86); hang()
     elif step == "deliver": emit(event="delivered"); sys.exit(0)
+    elif step == "zen": emit(event="trace", kind="zen", zen="started", browser="zen")
+    elif step == "await-done-and-linger":
+        while listen().get("do") != "done": pass
+        time.sleep(1.5); sys.exit(0)
+    elif step == "await-done":
+        while listen().get("do") != "done": pass
+        open(D + "/done-at", "w").write(repr(time.monotonic())); sys.exit(0)
     elif isinstance(step, str) and step.startswith("web:"): emit(event="web", why=step[4:]); hang()
     elif step == "crash": os.kill(os.getpid(), 11)
     elif step == "hang": hang()
@@ -156,6 +164,7 @@ sys.exit(1 if "code" in answer else 0)
         (self.state / "steps").write_text(json.dumps(["ready", *steps] if steps and steps[0] != "silent" else steps[1:]))
         (self.state / "steps-web").write_text(json.dumps(["prepared", "show", "ready", *web] if web and web[0] != "silent" else web[1:]))
         (self.state / "answers").write_text(json.dumps(list(answers)))
+        (self.state / "openconnect.log").write_text("POST https://ssl.vpn.ucla.edu/\nPlease complete the authentication process.\n")
         if key:
             (self.state / "approve-key.json").write_text("{}")
         vpn.write_json(self.state / "login-attempt.json",
@@ -605,6 +614,122 @@ sys.exit(1 if "code" in answer else 0)
         self.assertGreater(len(listed), 10)
         for path in listed:
             self.assertTrue(re.fullmatch(vpn.SignInTrace.FIELDS["path"], path), path)
+
+    ZEN = {"event": "trace", "kind": "zen", "browser": "zen"}
+
+    def openconnect_moves_on(self, after, post=True, close=True):
+        """What openconnect does once the browser's GET reached it: closes its listener, then logs its next POST."""
+        def act():
+            if close:
+                self.listening.clear()
+            if post:
+                with (self.state / "openconnect.log").open("a") as log:
+                    log.write("POST https://v2.ds.ssl.vpn.ucla.edu/\n")
+            self.moved = time.monotonic()
+        self.later(after, act)
+
+    def zen(self, web, **kw):
+        self.listening = {"openconnect"}
+        with patch.object(vpn, "callback_listeners", side_effect=lambda: list(self.listening and [1234])):
+            return self.signin(["web:key"], [self.CHALLENGE], web=web, **kw)
+
+    def test_browser_route_closes_the_moment_the_result_lands(self):
+        self.openconnect_moves_on(0.6)
+        code, run = self.zen(("zen", "await-done"))
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        self.assertFalse(vpn.login_cancelled())
+        self.assertEqual(self.told_web[-1], {"do": "done"})
+        latency = float((self.state / "done-at").read_text()) - self.moved
+        self.assertLess(latency, 0.15)  # kqueue on openconnect's own write, not the 0.2 s poll.
+        trace = (self.state / "signin-trace.log").read_text()
+        self.assertIn("kind=zen zen=started browser=zen", trace)
+        self.assertRegex(trace, r"ms=\d+ kind=landed\n")
+        self.assertIn("the browser's result reached openconnect", (self.state / "events.log").read_text())
+
+    def test_browser_route_needs_both_signs(self):
+        for post, close in ((True, False), (False, True)):
+            with self.subTest(post=post, close=close):
+                self.openconnect_moves_on(0.3, post=post, close=close)
+                code, run = self.zen(("zen", "await-done"), LOGIN_TIMEOUT=1.5)
+                self.assertEqual(code, 1)  # Timed out: not done, and nothing claimed.
+                self.assertNotIn({"do": "done"}, self.told_web)
+        # The POSTs logged before this sign-in began don't count.
+        self.openconnect_moves_on(0.3, post=False)
+        code, _ = self.zen(("zen", "await-done"), LOGIN_TIMEOUT=1.5)
+        self.assertNotIn({"do": "done"}, self.told_web)
+
+    def test_browser_route_cancel_and_late_close(self):
+        code, run = self.zen(("zen", 0.3, "cancel"))
+        self.assertEqual(code, 1)
+        self.assertTrue(vpn.login_cancelled())
+        run.assert_not_called()
+        # Zen's window closed by hand just after the result landed: still a login.
+        self.openconnect_moves_on(0.2)
+        code, run = self.zen(("zen", 0.6, "cancel"))
+        self.assertEqual(code, 0)
+        self.assertFalse(vpn.login_cancelled())
+
+    def test_browser_fallback_is_our_window_and_logged(self):
+        for state in ("unstartable", "error", "matched", "chosen-here", "unsupported", "no-browser"):
+            with self.subTest(state=state):
+                (self.state / "events.log").unlink(missing_ok=True)
+                self.openconnect_moves_on(0.2)
+                code, run = self.zen(("zen", {**self.ZEN, "zen": state}, 0.6, "deliver"))
+                self.assertEqual(code, 0)
+                run.assert_not_called()
+                events = (self.state / "events.log").read_text()
+                self.assertNotIn("reached openconnect", events)  # Our own window delivers for itself.
+                self.assertIn(f"the browser can't take it ({state})", events)
+
+    def test_no_busy_loop_on_openconnect_writes(self):
+        """The log keeps growing (tunnel setup) after done, and on routes that never watch it."""
+        real, calls = select.select, []
+
+        def counted(*args):
+            calls.append(1)
+            return real(*args)
+
+        def chatter():
+            for _ in range(20):
+                with (self.state / "openconnect.log").open("a") as log:
+                    log.write("POST https://v2.ds.ssl.vpn.ucla.edu/\nCSTP connected.\n")
+                time.sleep(0.05)
+        for web in (("zen", "await-done-and-linger"), (2.0, "deliver"), ({**self.ZEN, "zen": "chosen-here"}, 2.0, "deliver")):
+            with self.subTest(web=web):
+                calls.clear()
+                if web[0] == "zen":
+                    self.openconnect_moves_on(0.2)
+                self.later(0.3, chatter)
+                with patch.object(vpn.select, "select", side_effect=counted):
+                    began = time.monotonic()
+                    code, _ = self.zen(web)
+                    took = time.monotonic() - began
+                self.assertEqual(code, 0)
+                # A 0.2 s poll plus a wake per event; a spinning select would be thousands.
+                self.assertLess(len(calls), took / 0.2 + 60, f"{len(calls)} selects in {took:.1f} s")
+
+    def test_landing_reads_only_whats_new_and_wakes_on_write(self):
+        log = self.state / "openconnect.log"
+        log.write_text("POST https://ssl.vpn.ucla.edu/\n")
+        listening = [1]
+        with patch.object(vpn, "callback_listeners", side_effect=lambda: listening):
+            landing = vpn.Landing()
+            self.addCleanup(landing.close)
+            self.assertFalse(landing.landed())
+            listening.clear()
+            self.assertFalse(landing.landed())  # The old POST is not this sign-in's.
+            self.assertEqual(select.select([landing], [], [], 0)[0], [])
+            with log.open("a") as out:
+                out.write("POST https://v2.ds.ssl.vpn.ucla.edu/\n")
+            self.assertEqual(select.select([landing], [], [], 1)[0], [landing])
+            self.assertTrue(landing.landed())
+            listening.append(1)
+            self.assertFalse(landing.landed())  # Still listening: not yet.
+        with patch.object(vpn, "callback_listeners", side_effect=OSError):
+            self.assertTrue(landing.landed())  # The log alone, if lsof can't say.
+        log.unlink()
+        self.assertFalse(vpn.Landing().landed())  # No log (browser-login by hand): never claims.
 
     def test_proceeding_is_seen_from_the_listener_alone(self):
         with socket.create_server(("::1", 0), family=socket.AF_INET6) as server, \
@@ -1307,6 +1432,7 @@ class SignInWindowTests(unittest.TestCase):
 
     def test_web_and_approval_code_stay_apart(self):
         approval, web = ((self.swift() / name).read_text() for name in ("Approval.swift", "Web.swift"))
+        web += (self.swift() / "Zen.swift").read_text()  # The browser route runs in the web process.
         for word in ("import WebKit", "WKWeb", "WebController"):
             self.assertFalse(word in approval, word)
         for word in ("CryptoKit", "LocalAuthentication", "EnclaveKey", "KeyFile", "Approver", '"key"', "evaluateJavaScript",

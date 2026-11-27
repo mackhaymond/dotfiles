@@ -848,12 +848,19 @@ class ResultUnknown(Exception):
     """The callback may or may not have reached openconnect."""
 
 
+# What the --web app says about the browser route (Zen.swift). The fallbacks hand the
+# sign-in to our own web window.
+BROWSER_FALLBACKS = ("unstartable", "error", "matched", "chosen-here", "unsupported", "no-browser")
+BROWSER_STATES = ("started", "done", "cancelled", "closed", "closed-by-person", "retry", *BROWSER_FALLBACKS)
+
+
 class SignInTrace:
     """The web sign-in's steps, for when one goes wrong: signin-trace.log, the last three
     attempts. Only these fields in these shapes get in, so no query, token or page text
     can, whatever the window says."""
     FIELDS = {
-        "ms": r"\d{1,7}", "kind": "load|nav|redirect|response|loaded|failed|answer|lost",
+        "ms": r"\d{1,7}", "kind": "load|nav|redirect|response|loaded|failed|answer|lost|zen|landed",
+        "zen": "|".join(BROWSER_STATES), "browser": "zen|safari|firefox|chrome|other",
         "verdict": "allow|callback|finished|handoff|block|closed", "method": "GET|POST|other", "frame": "main|sub|new",
         "by": "link|form|history|reload|other|server", "status": r"-?\d{1,5}|none", "lost": "refused|silent|closed|gone|unknown",
         "origin": r"(?:https?|about|other)://(?:none|other|duo|localhost|127\.0\.0\.1|(?:[a-z0-9-]{1,30}\.){0,5}ucla\.edu)(?::29786|:other)?",
@@ -883,6 +890,8 @@ class SignInTrace:
                 log.write(" ".join(words) + "\n")
         except OSError:
             pass
+        if event.get("kind") == "zen" and event.get("zen") in BROWSER_FALLBACKS:
+            log_event(f"web sign-in: the browser can't take it ({event['zen']}); using our own window")
         if event.get("kind") == "lost":
             log_event("web sign-in lost: " + " ".join(word for word in words if word.startswith(("lost=", "status="))))
 
@@ -893,6 +902,8 @@ class SignInWindow:
     def __init__(self, binary, wanted, *arguments):
         self.wanted, self.events, self.buffer = wanted, [], b""
         self.card = not arguments
+        # The browser route: on while the person's browser has the sign-in.
+        self.browser, self.watch = False, None
         self.trace = None if self.card else SignInTrace()
         self.process = subprocess.Popen([str(binary), *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
@@ -908,7 +919,11 @@ class SignInWindow:
         """Collect the window's events for a moment; the others that are readable."""
         if not self.wanted():
             raise NotWanted
-        ready = select.select([self.process.stdout, *others], [], [], timeout)[0]
+        # Only while it can matter: a kqueue that is never drained stays readable.
+        watched = [self.watch] if self.watch and self.browser and not self.watch.told and self.watch.fileno() is not None else []
+        ready = select.select([self.process.stdout, *watched, *others], [], [], timeout)[0]
+        if watched and self.watch in ready:
+            self.watch.drain()
         if self.process.stdout in ready:
             data = os.read(self.process.stdout.fileno(), 4096)
             if not data:
@@ -922,11 +937,15 @@ class SignInWindow:
                 if isinstance(event, dict) and event.get("event") == "trace":
                     if self.trace:
                         self.trace.add(event)
+                    if not self.card and event.get("kind") == "zen":
+                        self.browser = event.get("zen") == "started" or (self.browser and event.get("zen") not in BROWSER_FALLBACKS)
                 elif isinstance(event, dict):
                     self.events.append(event)
                     if self.card and event.get("event") == "web":
                         raise UseWeb(event.get("why"))
-        return [other for other in ready if other is not self.process.stdout]
+        if self.watch and self.browser and not self.watch.told:
+            self.watch.check(self)
+        return [other for other in ready if other is not self.process.stdout and other not in watched]
 
     def next(self, *names, timeout=None):
         """The next event with one of these names; None after the timeout."""
@@ -1079,6 +1098,71 @@ def callback_listeners():
     """PIDs listening for the callback. A look from outside: connecting would disturb it."""
     output = capture(["/usr/sbin/lsof", "-nP", f"-iTCP:{CALLBACK_PORT}", "-sTCP:LISTEN", "-Fp"]).stdout
     return [int(line[1:]) for line in output.splitlines() if re.fullmatch(r"p\d+", line)]
+
+
+class Landing:
+    """Whether openconnect has the browser's result, for the browser route, where our
+    app never sees the localhost hop. Two signs, both required: openconnect logs its
+    next "POST https://…" (it can only get there once hpke.c decoded the token), and it
+    has closed its listener (hpke.c's `out:` path, right after answering the GET). The
+    log is watched with kqueue, so this wakes on openconnect's own write."""
+
+    def __init__(self, trace=None):
+        self.path, self.text, self.told, self.trace = STATE / "openconnect.log", "", False, trace
+        self.began = time.monotonic()
+        self.fd = self.queue = None
+        try:
+            self.fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            self.offset = os.fstat(self.fd).st_size  # Only what openconnect writes from now on.
+            self.queue = select.kqueue()
+            self.queue.control([select.kevent(self.fd, filter=select.KQ_FILTER_VNODE,
+                                              flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                              fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)], 0, 0)
+        except (OSError, AttributeError):
+            self.close()
+
+    def fileno(self):
+        return self.queue.fileno() if self.queue else None
+
+    def drain(self):
+        try:
+            if self.queue:
+                self.queue.control(None, 8, 0)
+        except OSError:
+            pass
+
+    def landed(self):
+        if self.fd is None:
+            return False
+        self.drain()  # What changed is read below.
+        try:
+            data = os.pread(self.fd, 65536, self.offset)
+        except OSError:
+            return False
+        self.offset += len(data)
+        self.text = (self.text + data.decode("utf-8", "replace"))[-65536:]
+        if not re.search(r"(?m)^POST https://", self.text):
+            return False
+        try:
+            return not callback_listeners()
+        except (OSError, subprocess.SubprocessError):
+            return True  # The log alone: openconnect is past the browser either way.
+
+    def check(self, window):
+        if not self.told and self.landed():
+            self.told = True
+            if self.trace:
+                self.trace.add({"kind": "landed", "ms": str(int((time.monotonic() - self.began) * 1000))})
+            log_event("the browser's result reached openconnect")
+            window.tell(do="done")
+
+    def close(self):
+        for thing in (self.queue,):
+            if thing:
+                thing.close()
+        if self.fd is not None:
+            os.close(self.fd)
+        self.fd = self.queue = None
 
 
 def openconnect_proceeded():
@@ -1309,7 +1393,8 @@ def run_signin(url, attempt, asker):
 
 
 def web_login(binary, url, why, card, wanted):
-    """UCLA's own pages, in a process that has neither the approval key nor vlt."""
+    """UCLA's own pages, in a process that has neither the approval key nor vlt: in the
+    person's browser (Zen) when it can take them, else in our own web window."""
     reason, more = HAND_OVER[why]
 
     def still_wanted():
@@ -1329,7 +1414,8 @@ def web_login(binary, url, why, card, wanted):
     except OSError as error:
         use_zen(f"web sign-in failed: {type(error).__name__}")
     try:
-        window.tell(url=url, reason=f"{reason}, so sign in here." if reason else "")
+        window.watch = Landing(window.trace)
+        window.tell(url=url, reason=reason)
         if window.next("prepared", timeout=SIGNIN_READY_SECONDS) is None:
             use_zen("web sign-in did not open in time")
         # The card goes first: once it is gone it can't be cancelled any more, so a
@@ -1346,6 +1432,8 @@ def web_login(binary, url, why, card, wanted):
         return "done"
     except WindowClosed:
         code = window.exit_code()
+        if window.browser and window.watch.landed():
+            return "done"  # Its window was closed after the result had landed anyway.
         if code == SIGNIN_CANCELLED:
             return "cancelled"
         if code == 0:
@@ -1353,6 +1441,8 @@ def web_login(binary, url, why, card, wanted):
         use_zen(f"web sign-in failed (exit {code})")
     finally:
         window.close()
+        if window.watch:
+            window.watch.close()
 
 
 def login_url_ok(url):
